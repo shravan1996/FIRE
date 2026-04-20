@@ -1,0 +1,167 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model UserProfile {
+  id           String   @id @default(cuid())
+  name         String
+  monthlyIncome Float
+  netWorth     Float?
+  goalAmount   Float?
+  goalYear     Int?
+  riskAppetite String   @default("moderate") // conservative | moderate | aggressive
+  taxRegime    String   @default("new") // old | new
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  holdings     Holding[]
+  transactions Transaction[]
+  sessions     ChatSession[]
+  insights     AgentInsight[]
+  userMemory   UserMemory[]
+}
+
+model Holding {
+  id          String   @id @default(cuid())
+  userId      String
+  assetType   String   // mf | equity | etf | fd | real_estate | other
+  name        String
+  ticker      String?
+  units       Float?
+  currentNav  Float?
+  investedAmount Float
+  currentValue   Float?
+  category    String?  // large_cap | mid_cap | small_cap | debt | hybrid | international
+  notes       String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user        UserProfile @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Transaction {
+  id          String   @id @default(cuid())
+  userId      String
+  date        DateTime
+  description String
+  amount      Float
+  type        String   // credit | debit
+  category    String?  // needs | wants | waste | investment | income | transfer
+  subCategory String?  // rent | food | emi | subscription | dining | etc.
+  merchant    String?
+  source      String   @default("manual") // manual | csv | bank_api
+  rawData     String?  // original CSV row as JSON
+  createdAt   DateTime @default(now())
+
+  user        UserProfile @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model ChatSession {
+  id         String   @id @default(cuid())
+  userId     String
+  title      String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  user       UserProfile  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages   ChatMessage[]
+}
+
+model ChatMessage {
+  id        String   @id @default(cuid())
+  sessionId String
+  role      String   // user | assistant | system
+  content   String
+  agentOutputs String? // JSON: AgentOutput[]
+  synthesis    String? // JSON: SynthesisOutput
+  createdAt DateTime @default(now())
+
+  session   ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+}
+
+// Versioned insight store — agents read from here, writes go through promotion
+model AgentInsight {
+  id           String   @id @default(cuid())
+  userId       String
+  agentName    String   // market_researcher | accountant | investment_manager | tax_analyst | finance_friend | synthesizer
+  insightType  String   // observation | pattern | recommendation | warning
+  title        String
+  content      String
+  evidence     String   // JSON: string[] of supporting data points
+  confidence   Float    @default(50)
+  scope        String   @default("user") // user | global
+  status       String   @default("pending") // pending | approved | rejected | superseded
+  version      Int      @default(1)
+  timesUsed    Int      @default(0)
+  lastUsedAt   DateTime?
+  approvedAt   DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  user         UserProfile @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// Stable user-level memory injected into all agent runs
+model UserMemory {
+  id        String   @id @default(cuid())
+  userId    String
+  key       String   // e.g. "risk_preference_signal" | "recurring_waste" | "accepted_action"
+  value     String   // JSON payload
+  source    String   // session_id or "manual"
+  expiresAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user      UserProfile @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, key])
+}
+
+// Playbook patterns — reusable heuristics for the leader agent
+model PlaybookPattern {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  description String
+  trigger     String   // JSON: condition that activates the pattern
+  action      String   // JSON: what the orchestrator should do
+  agentScope  String   // which agent(s) this applies to, or "all"
+  status      String   @default("active") // active | disabled
+  version     Int      @default(1)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+// Candidate insights awaiting review before promotion
+model InsightCandidate {
+  id          String   @id @default(cuid())
+  userId      String
+  sessionId   String
+  agentName   String
+  insightType String
+  title       String
+  content     String
+  evidence    String   // JSON
+  confidence  Float
+  extractedAt DateTime @default(now())
+  reviewedAt  DateTime?
+  decision    String?  // approved | rejected
+  promotedId  String?  // links to AgentInsight after promotion
+}
+
+// Version history for editable markdown agent skills
+model SkillRevision {
+  id         String   @id @default(cuid())
+  skillName  String
+  content    String
+  summary    String?
+  editor     String?
+  createdAt  DateTime @default(now())
+
+  @@index([skillName, createdAt])
+}
