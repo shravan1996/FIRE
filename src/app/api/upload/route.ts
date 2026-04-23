@@ -3,7 +3,7 @@ import {
   parseFile, extractFileText,
   isSupportedFile, SUPPORTED_EXTENSIONS,
 } from "@/lib/ingestion/parse-file";
-import { categorizeTransactions } from "@/lib/ingestion/parse-transactions";
+import { categorizeTransactions, type RawTransaction } from "@/lib/ingestion/parse-transactions";
 import { prisma } from "@/lib/db";
 
 const MAX_SIZE = 10 * 1024 * 1024; // 10 MB
@@ -14,6 +14,115 @@ type DocumentCategory = typeof DOCUMENT_CATEGORIES[number];
 
 function isDocumentCategory(c: string): c is DocumentCategory {
   return (DOCUMENT_CATEGORIES as readonly string[]).includes(c);
+}
+
+function txnKey(t: { date: Date; description: string; amount: number }) {
+  return `${t.date.toISOString()}|${t.description}|${t.amount}`;
+}
+
+/**
+ * Dedupe against existing transactions in the file's date range,
+ * then bulk-insert everything new.
+ */
+async function bulkInsertRawTransactions(
+  userId: string,
+  txns: RawTransaction[],
+  source: string
+): Promise<{ inserted: RawTransaction[]; skipped: number }> {
+  if (txns.length === 0) return { inserted: [], skipped: 0 };
+
+  let minDate = txns[0].date, maxDate = txns[0].date;
+  for (const t of txns) {
+    if (t.date < minDate) minDate = t.date;
+    if (t.date > maxDate) maxDate = t.date;
+  }
+
+  const existing = await prisma.transaction.findMany({
+    where: { userId, date: { gte: minDate, lte: maxDate } },
+    select: { date: true, description: true, amount: true },
+  });
+  const existingKeys = new Set(existing.map(txnKey));
+
+  const fresh = txns.filter((t) => !existingKeys.has(txnKey(t)));
+  const skipped = txns.length - fresh.length;
+
+  if (fresh.length > 0) {
+    await prisma.transaction.createMany({
+      data: fresh.map((t) => ({
+        userId,
+        date: t.date,
+        description: t.description,
+        amount: t.amount,
+        type: t.type,
+        source,
+        rawData: t.rawData,
+      })),
+    });
+  }
+
+  return { inserted: fresh, skipped };
+}
+
+/**
+ * Append a compact record of this upload to the user's `uploaded_files` memory
+ * entry so the FIRE chat agent can see every file the user has shared.
+ */
+async function recordUpload(
+  userId: string,
+  filename: string,
+  category: string,
+  transactionsAdded?: number,
+) {
+  const key = "uploaded_files";
+  const existing = await prisma.userMemory.findUnique({
+    where: { userId_key: { userId, key } },
+  });
+
+  let list: unknown[] = [];
+  if (existing) {
+    try {
+      const parsed = JSON.parse(existing.value);
+      if (Array.isArray(parsed)) list = parsed;
+    } catch { /* overwrite malformed */ }
+  }
+
+  list.push({
+    filename,
+    category,
+    uploadedAt: new Date().toISOString(),
+    ...(transactionsAdded !== undefined ? { transactionsAdded } : {}),
+  });
+
+  await prisma.userMemory.upsert({
+    where: { userId_key: { userId, key } },
+    create: { userId, key, value: JSON.stringify(list), source: "upload" },
+    update: { value: JSON.stringify(list) },
+  });
+}
+
+/** Fire-and-forget: run Claude categorisation and update rows in place. */
+async function categoriseAndUpdate(userId: string, txns: RawTransaction[]) {
+  try {
+    const categorised = await categorizeTransactions(txns);
+    for (const c of categorised) {
+      await prisma.transaction.updateMany({
+        where: {
+          userId,
+          date: c.date,
+          description: c.description,
+          amount: c.amount,
+          category: null,
+        },
+        data: {
+          category: c.category,
+          subCategory: c.subCategory,
+          merchant: c.merchant || null,
+        },
+      });
+    }
+  } catch (err) {
+    console.error("[upload:bg] categorise failed:", err);
+  }
 }
 
 export async function POST(req: NextRequest) {
@@ -39,14 +148,13 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "File too large (max 10 MB)" }, { status: 400 });
     }
 
-    // ─── Non-bank documents: just extract text and store as memory ───
+    // ─── Non-bank documents: extract raw text and store as memory ───
     if (isDocumentCategory(category)) {
       let text = "";
       try {
         text = (await extractFileText(file)).trim();
       } catch (extractErr) {
         console.warn(`[upload] text extraction failed for ${file.name}:`, extractErr);
-        // continue anyway — the filename alone is still useful to FIRE
       }
 
       const key = `docs_${category}`;
@@ -75,6 +183,8 @@ export async function POST(req: NextRequest) {
         update: { value: JSON.stringify(list) },
       });
 
+      await recordUpload(userId, file.name, category);
+
       return NextResponse.json({
         success: true,
         category,
@@ -84,49 +194,36 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // ─── Bank statement flow: extract + categorise transactions ───
+    // ─── Bank statement flow ───
+    const tParseStart = Date.now();
     const rawTransactions = await parseFile(file);
+    const tParseEnd = Date.now();
 
     if (rawTransactions.length === 0) {
       return NextResponse.json({ error: "No valid transactions found in file" }, { status: 400 });
     }
 
-    const categorized = await categorizeTransactions(rawTransactions);
     const source = file.name.split(".").pop()?.toLowerCase() ?? "upload";
+    const { inserted, skipped } = await bulkInsertRawTransactions(userId, rawTransactions, source);
+    const tInsertEnd = Date.now();
 
-    let inserted = 0;
-    let skipped = 0;
+    console.log(
+      `[upload] ${file.name}: parse=${tParseEnd - tParseStart}ms ` +
+      `insert=${tInsertEnd - tParseEnd}ms ` +
+      `txns=${rawTransactions.length} new=${inserted.length} dup=${skipped}`
+    );
 
-    for (const txn of categorized) {
-      const existing = await prisma.transaction.findFirst({
-        where: { userId, date: txn.date, description: txn.description, amount: txn.amount },
-      });
+    await recordUpload(userId, file.name, "bank", inserted.length);
 
-      if (existing) { skipped++; continue; }
-
-      await prisma.transaction.create({
-        data: {
-          userId,
-          date: txn.date,
-          description: txn.description,
-          amount: txn.amount,
-          type: txn.type,
-          category: txn.category,
-          subCategory: txn.subCategory,
-          merchant: txn.merchant || null,
-          source,
-          rawData: txn.rawData,
-        },
-      });
-      inserted++;
-    }
+    // Fire-and-forget: categorise in the background, update rows as they complete.
+    if (inserted.length > 0) void categoriseAndUpdate(userId, inserted);
 
     return NextResponse.json({
       success: true,
       total: rawTransactions.length,
-      inserted,
+      inserted: inserted.length,
       skipped,
-      message: `Imported ${inserted} transactions (${skipped} duplicates skipped).`,
+      message: `Imported ${inserted.length} transactions${skipped ? ` (${skipped} duplicates skipped)` : ""}. Categorising in background.`,
     });
   } catch (err) {
     console.error("[upload] error:", err);

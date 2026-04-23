@@ -45,7 +45,10 @@ async function buildUserContext(userId: string): Promise<UserContext> {
       where: { id: userId },
       include: {
         holdings: true,
-        transactions: { orderBy: { date: "desc" }, take: 60 },
+        // Load every transaction the user has imported — capped only for safety
+        // against runaway datasets. With Claude's 1M context the agent can
+        // analyse several years of bank activity in one shot.
+        transactions: { orderBy: { date: "desc" }, take: 20000 },
       },
     }),
     loadAgentMemory(userId),
@@ -108,15 +111,94 @@ function buildUserPrompt(ctx: UserContext, message: string): string {
       }).join("\n")
     : "No holdings provided.";
 
-  // Transactions
-  const txnText = ctx.recentTransactions.length
-    ? ctx.recentTransactions
-        .slice(0, 60)
-        .map((t) =>
-          `${t.date} | ${t.type.toUpperCase()} | ${fmt(t.amount)} | ${t.description}${t.category ? ` [${t.category}]` : ""}`
-        )
-        .join("\n")
-    : "No recent transactions.";
+  // Transactions — build aggregate summary + full chronological list so the
+  // agent can answer both "what's my overall spending pattern" and "what did
+  // I spend on 2025-08-14" without ever being capped to a rolling window.
+  const txns = ctx.recentTransactions;
+  let txnSummaryText: string;
+  let txnListText: string;
+
+  if (txns.length === 0) {
+    txnSummaryText = "No transactions available.";
+    txnListText = "No transactions available.";
+  } else {
+    let totalCredits = 0, totalDebits = 0;
+    let creditCount = 0, debitCount = 0;
+    const byMonth = new Map<string, { inflow: number; outflow: number; count: number }>();
+    const byCategory = new Map<string, number>();
+    let uncategorisedDebits = 0;
+    const byMerchant = new Map<string, { amount: number; count: number }>();
+
+    for (const t of txns) {
+      if (t.type === "credit") { totalCredits += t.amount; creditCount++; }
+      else if (t.type === "debit") { totalDebits += t.amount; debitCount++; }
+
+      const monthKey = t.date.slice(0, 7); // YYYY-MM
+      const m = byMonth.get(monthKey) ?? { inflow: 0, outflow: 0, count: 0 };
+      if (t.type === "credit") m.inflow += t.amount;
+      else if (t.type === "debit") m.outflow += t.amount;
+      m.count++;
+      byMonth.set(monthKey, m);
+
+      if (t.type === "debit") {
+        if (t.category) byCategory.set(t.category, (byCategory.get(t.category) ?? 0) + t.amount);
+        else uncategorisedDebits += t.amount;
+
+        const merchantKey = t.description.slice(0, 40).toUpperCase();
+        const entry = byMerchant.get(merchantKey) ?? { amount: 0, count: 0 };
+        entry.amount += t.amount;
+        entry.count += 1;
+        byMerchant.set(merchantKey, entry);
+      }
+    }
+
+    // chronological range
+    const sortedAsc = [...txns].sort((a, b) => a.date.localeCompare(b.date));
+    const firstDate = sortedAsc[0].date;
+    const lastDate = sortedAsc[sortedAsc.length - 1].date;
+
+    const monthlyLines = Array.from(byMonth.entries())
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([k, v]) => {
+        const net = v.inflow - v.outflow;
+        const sign = net >= 0 ? "+" : "";
+        return `  ${k}: in ${fmt(v.inflow)} / out ${fmt(v.outflow)} (net ${sign}${fmt(net)}, ${v.count} txns)`;
+      })
+      .join("\n");
+
+    const catTotal = totalDebits || 1;
+    const categoryLines = Array.from(byCategory.entries())
+      .sort(([, a], [, b]) => b - a)
+      .map(([k, v]) => `  ${k}: ${fmt(v)} (${((v / catTotal) * 100).toFixed(1)}%)`)
+      .join("\n");
+    const uncatLine = uncategorisedDebits > 0
+      ? `\n  uncategorised: ${fmt(uncategorisedDebits)} (${((uncategorisedDebits / catTotal) * 100).toFixed(1)}%)`
+      : "";
+
+    const topMerchants = Array.from(byMerchant.entries())
+      .sort(([, a], [, b]) => b.amount - a.amount)
+      .slice(0, 15)
+      .map(([k, v], i) => `  ${i + 1}. ${k} — ${fmt(v.amount)} (${v.count} txns)`)
+      .join("\n");
+
+    txnSummaryText = `Period: ${firstDate} → ${lastDate}
+Totals: ${creditCount} credits of ${fmt(totalCredits)}, ${debitCount} debits of ${fmt(totalDebits)}, net ${fmt(totalCredits - totalDebits)}
+
+Monthly flow:
+${monthlyLines}
+
+Spending by category (debits):
+${categoryLines}${uncatLine}
+
+Top merchants by spend:
+${topMerchants}`;
+
+    // Full list — reverse-chronological (matches the DB query) so the most
+    // recent context is near the end of the prompt where the model attends most.
+    txnListText = txns
+      .map((t) => `${t.date} | ${t.type.toUpperCase()} | ${fmt(t.amount)} | ${t.description}${t.category ? ` [${t.category}]` : ""}`)
+      .join("\n");
+  }
 
   // Insights
   const insightsText = ctx.activeInsights.length
@@ -125,9 +207,35 @@ function buildUserPrompt(ctx: UserContext, message: string): string {
         .join("\n")
     : "None yet.";
 
-  // Memory
-  const memoryText = ctx.userMemory.length
-    ? ctx.userMemory.map((m) => `- ${m.key}: ${m.value}`).join("\n")
+  // Uploaded files — pull out the `uploaded_files` entry and render compactly.
+  // Each entry: { filename, category, uploadedAt, transactionsAdded? }
+  let uploadedFilesText = "None yet.";
+  const uploadsEntry = ctx.userMemory.find((m) => m.key === "uploaded_files");
+  if (uploadsEntry) {
+    try {
+      const files = JSON.parse(uploadsEntry.value) as Array<{
+        filename: string;
+        category: string;
+        uploadedAt: string;
+        transactionsAdded?: number;
+      }>;
+      if (Array.isArray(files) && files.length > 0) {
+        uploadedFilesText = files
+          .map((f) => {
+            const date = f.uploadedAt?.slice(0, 10) ?? "";
+            const txns = typeof f.transactionsAdded === "number" ? `, ${f.transactionsAdded} txns` : "";
+            return `- ${f.filename}  (${f.category}, ${date}${txns})`;
+          })
+          .join("\n");
+      }
+    } catch { /* fall back to "None yet." */ }
+  }
+
+  // Memory — exclude `uploaded_files` (rendered above) to avoid duplicating
+  // the list as a giant JSON blob in the notes section.
+  const otherMemory = ctx.userMemory.filter((m) => m.key !== "uploaded_files");
+  const memoryText = otherMemory.length
+    ? otherMemory.map((m) => `- ${m.key}: ${m.value}`).join("\n")
     : "None.";
 
   return `--- User Profile ---
@@ -136,8 +244,14 @@ ${profileLines}
 --- Portfolio (total ≈ ${fmt(total)}) ---
 ${holdingsText}
 
---- Recent Transactions (last 60) ---
-${txnText}
+--- Transaction Summary (${txns.length} transactions) ---
+${txnSummaryText}
+
+--- All Transactions (newest first) ---
+${txnListText}
+
+--- Uploaded Files ---
+${uploadedFilesText}
 
 --- Insights from Prior Sessions ---
 ${insightsText}

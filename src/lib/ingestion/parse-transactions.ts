@@ -16,72 +16,94 @@ export interface CategorizedTransaction extends RawTransaction {
   merchant: string;
 }
 
-// Known Indian bank CSV column mappings
-const DATE_KEYS = ["date", "txn date", "transaction date", "value date", "posting date"];
-const DESC_KEYS = ["description", "narration", "particulars", "remarks", "txn remarks"];
-const DEBIT_KEYS = ["debit", "withdrawal", "dr", "debit amount", "withdrawal amt"];
-const CREDIT_KEYS = ["credit", "deposit", "cr", "credit amount", "deposit amt"];
-const AMOUNT_KEYS = ["amount", "transaction amount"];
+// Substring fragments that match common Indian bank column headers.
+// Covers SBI/HDFC/ICICI/Axis/Kotak variants: "Txn Date", "Tran Date", "Value Dt",
+// "Narration", "Description", "Transaction Remarks", "Withdrawal Amt.",
+// "Withdrawal Amount (INR)", "Deposit Amt.", etc.
+const DATE_FRAGMENTS   = ["date", "dt."];
+const DESC_FRAGMENTS   = ["narrat", "description", "particular", "remark", "detail"];
+const DEBIT_FRAGMENTS  = ["debit", "withdraw", "dr "];
+const CREDIT_FRAGMENTS = ["credit", "deposit", "cr "];
+const AMOUNT_FRAGMENTS = ["amount", "amt"];
+const BALANCE_FRAGMENTS = ["balance", "bal"];
 
 function normalizeKey(k: string) {
-  return k.toLowerCase().trim();
+  return k.toLowerCase().trim().replace(/\s+/g, " ");
 }
 
-function findColumn(headers: string[], candidates: string[]): string | null {
+// Match if any fragment appears as substring of any header, but skip balance columns.
+function findColumn(headers: string[], fragments: string[], excludeFragments: string[] = BALANCE_FRAGMENTS): string | null {
   for (const h of headers) {
-    if (candidates.includes(normalizeKey(h))) return h;
+    const normalized = normalizeKey(h);
+    if (excludeFragments.some((f) => normalized.includes(f))) continue;
+    if (fragments.some((f) => normalized.includes(f))) return h;
   }
   return null;
 }
 
-function parseIndianDate(raw: string): Date | null {
-  // dd/mm/yyyy, dd-mm-yyyy, dd MMM yyyy, yyyy-mm-dd
-  const clean = raw.trim();
-  const formats = [
-    /^(\d{2})\/(\d{2})\/(\d{4})$/, // dd/mm/yyyy
-    /^(\d{2})-(\d{2})-(\d{4})$/, // dd-mm-yyyy
-    /^(\d{4})-(\d{2})-(\d{2})$/, // yyyy-mm-dd
-  ];
+const MONTHS: Record<string, number> = {
+  jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
+  jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11,
+};
 
-  for (const fmt of formats) {
-    const m = clean.match(fmt);
-    if (m) {
-      const [, a, b, c] = m;
-      // Detect ISO vs DMY
-      const year = a.length === 4 ? parseInt(a) : parseInt(c);
-      const month = a.length === 4 ? parseInt(b) - 1 : parseInt(b) - 1;
-      const day = a.length === 4 ? parseInt(c) : parseInt(a);
-      const d = new Date(year, month, day);
+function parseIndianDate(raw: string): Date | null {
+  const clean = raw.trim();
+  if (!clean) return null;
+
+  // dd/mm/yyyy or dd/mm/yy
+  let m = clean.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
+  if (m) {
+    const day = parseInt(m[1]);
+    const month = parseInt(m[2]) - 1;
+    let year = parseInt(m[3]);
+    if (year < 100) year += year < 50 ? 2000 : 1900;
+    const d = new Date(year, month, day);
+    if (!isNaN(d.getTime())) return d;
+  }
+
+  // yyyy-mm-dd
+  m = clean.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (m) {
+    const d = new Date(parseInt(m[1]), parseInt(m[2]) - 1, parseInt(m[3]));
+    if (!isNaN(d.getTime())) return d;
+  }
+
+  // dd-MMM-yyyy, dd MMM yyyy, dd-MMM-yy
+  m = clean.match(/^(\d{1,2})[\s\-]([A-Za-z]{3})[\s\-](\d{2,4})$/);
+  if (m) {
+    const month = MONTHS[m[2].toLowerCase()];
+    if (month !== undefined) {
+      let year = parseInt(m[3]);
+      if (year < 100) year += year < 50 ? 2000 : 1900;
+      const d = new Date(year, month, parseInt(m[1]));
       if (!isNaN(d.getTime())) return d;
     }
   }
 
-  // Try natural parsing as fallback
+  // Fallback: native Date parsing
   const natural = new Date(clean);
   return isNaN(natural.getTime()) ? null : natural;
 }
 
-export function parseCSV(csvText: string): RawTransaction[] {
-  const result = Papa.parse<Record<string, string>>(csvText, {
+function tryParseAt(csvText: string, skipLines: number): RawTransaction[] | null {
+  const lines = csvText.split(/\r?\n/);
+  if (skipLines >= lines.length) return null;
+  const sliced = lines.slice(skipLines).join("\n");
+
+  const result = Papa.parse<Record<string, string>>(sliced, {
     header: true,
     skipEmptyLines: true,
     transformHeader: (h) => h.trim(),
   });
 
-  if (result.errors.length && result.data.length === 0) {
-    throw new Error(`CSV parse failed: ${result.errors[0].message}`);
-  }
+  const headers  = result.meta.fields ?? [];
+  const dateCol  = findColumn(headers, DATE_FRAGMENTS);
+  const descCol  = findColumn(headers, DESC_FRAGMENTS);
+  const debitCol = findColumn(headers, DEBIT_FRAGMENTS);
+  const creditCol = findColumn(headers, CREDIT_FRAGMENTS);
+  const amountCol = findColumn(headers, AMOUNT_FRAGMENTS);
 
-  const headers = result.meta.fields ?? [];
-  const dateCol = findColumn(headers, DATE_KEYS);
-  const descCol = findColumn(headers, DESC_KEYS);
-  const debitCol = findColumn(headers, DEBIT_KEYS);
-  const creditCol = findColumn(headers, CREDIT_KEYS);
-  const amountCol = findColumn(headers, AMOUNT_KEYS);
-
-  if (!dateCol || !descCol) {
-    throw new Error("CSV must have date and description/narration columns.");
-  }
+  if (!dateCol || !descCol) return null;
 
   const transactions: RawTransaction[] = [];
 
@@ -96,31 +118,42 @@ export function parseCSV(csvText: string): RawTransaction[] {
     let type: "credit" | "debit" = "debit";
 
     if (debitCol && creditCol) {
-      const debit = parseFloat((row[debitCol] ?? "").replace(/[,₹\s]/g, "")) || 0;
+      const debit  = parseFloat((row[debitCol]  ?? "").replace(/[,₹\s]/g, "")) || 0;
       const credit = parseFloat((row[creditCol] ?? "").replace(/[,₹\s]/g, "")) || 0;
-      if (debit > 0) { amount = debit; type = "debit"; }
-      else if (credit > 0) { amount = credit; type = "credit"; }
+      if (debit > 0)      { amount = debit;  type = "debit";  }
+      else if (credit > 0){ amount = credit; type = "credit"; }
       else continue;
     } else if (amountCol) {
       const raw = (row[amountCol] ?? "").replace(/[,₹\s]/g, "");
       amount = Math.abs(parseFloat(raw)) || 0;
-      type = parseFloat(raw) < 0 ? "debit" : "credit";
+      type   = parseFloat(raw) < 0 ? "debit" : "credit";
     } else {
       continue;
     }
 
     if (amount === 0) continue;
 
-    transactions.push({
-      date,
-      description,
-      amount,
-      type,
-      rawData: JSON.stringify(row),
-    });
+    transactions.push({ date, description, amount, type, rawData: JSON.stringify(row) });
   }
 
   return transactions;
+}
+
+export function parseCSV(csvText: string): RawTransaction[] {
+  // Many Indian bank statements include 2-8 metadata rows before the header.
+  // Try different skip offsets and pick the first that finds real columns.
+  let best: RawTransaction[] = [];
+  for (let skip = 0; skip < 15; skip++) {
+    const result = tryParseAt(csvText, skip);
+    if (result && result.length > best.length) {
+      best = result;
+      if (best.length >= 5) break; // good enough, bail early
+    }
+  }
+  if (best.length === 0) {
+    throw new Error("CSV must have date and description/narration columns.");
+  }
+  return best;
 }
 
 const CategorizationResultSchema = z.object({
@@ -147,36 +180,49 @@ const CATEGORIZATION_SYSTEM = `You are a bank transaction categorizer for Indian
 
 Return JSON: { "transactions": [{ "index": n, "category": "...", "subCategory": "...", "merchant": "..." }] }`;
 
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let idx = 0;
+  const worker = async () => {
+    while (true) {
+      const current = idx++;
+      if (current >= items.length) return;
+      results[current] = await fn(items[current]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
 export async function categorizeTransactions(
   txns: RawTransaction[]
 ): Promise<CategorizedTransaction[]> {
   if (txns.length === 0) return [];
 
   const CHUNK = 40;
+  const MAX_CONCURRENT = 3;
   const offsets: number[] = [];
   for (let i = 0; i < txns.length; i += CHUNK) offsets.push(i);
 
-  const chunkResults = await Promise.all(
-    offsets.map(async (offset) => {
-      const chunk = txns.slice(offset, offset + CHUNK);
-      const payload = chunk.map((t, idx) => ({
-        index: offset + idx,
-        description: t.description,
-        amount: t.amount,
-        type: t.type,
-      }));
+  const chunkResults = await mapLimit(offsets, MAX_CONCURRENT, async (offset) => {
+    const chunk = txns.slice(offset, offset + CHUNK);
+    const payload = chunk.map((t, idx) => ({
+      index: offset + idx,
+      description: t.description,
+      amount: t.amount,
+      type: t.type,
+    }));
 
-      try {
-        const raw = JSON.parse(
-          await claudeComplete(CATEGORIZATION_SYSTEM, JSON.stringify(payload))
-        );
-        const parsed = CategorizationResultSchema.safeParse(raw);
-        return parsed.success ? parsed.data.transactions : [];
-      } catch {
-        return [];
-      }
-    })
-  );
+    try {
+      const raw = JSON.parse(
+        await claudeComplete(CATEGORIZATION_SYSTEM, JSON.stringify(payload))
+      );
+      const parsed = CategorizationResultSchema.safeParse(raw);
+      return parsed.success ? parsed.data.transactions : [];
+    } catch {
+      return [];
+    }
+  });
 
   const categorized: CategorizedTransaction[] = [];
   for (const result of chunkResults.flat()) {

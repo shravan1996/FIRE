@@ -3,7 +3,7 @@
 import { useRef, useState } from "react";
 import {
   Flame, Landmark, LineChart, Receipt, Shield, Home,
-  Loader2, CheckCircle2, AlertCircle, X, ArrowRight, FileText,
+  Loader2, CheckCircle2, AlertCircle, X, ArrowRight, ArrowLeft, FileText, Trash2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -60,10 +60,29 @@ interface Props {
   userId: string;
   userName: string;
   onContinue: () => void;
+  onBack?: () => void;
 }
 
-export function DocumentUploadPage({ userId, userName, onContinue }: Props) {
+export function DocumentUploadPage({ userId, userName, onContinue, onBack }: Props) {
   const [uploads, setUploads] = useState<Record<string, UploadedFile[]>>({});
+  const [clearing, setClearing] = useState(false);
+  const categoryQueuesRef = useRef<Record<string, Promise<void>>>({});
+
+  async function handleClearAll() {
+    if (!confirm("Remove every uploaded document and transaction for this profile? This cannot be undone.")) return;
+    setClearing(true);
+    try {
+      const res = await fetch(`/api/uploads/reset?userId=${userId}`, { method: "POST" });
+      if (res.ok) {
+        setUploads({});
+      } else {
+        const data = await res.json();
+        alert(data.error ?? "Failed to clear uploads");
+      }
+    } finally {
+      setClearing(false);
+    }
+  }
 
   async function handleFiles(categoryKey: string, files: FileList | null) {
     if (!files || files.length === 0) return;
@@ -78,8 +97,8 @@ export function DocumentUploadPage({ userId, userName, onContinue }: Props) {
       [categoryKey]: [...(prev[categoryKey] ?? []), ...newEntries.map((e) => e.entry)],
     }));
 
-    await Promise.all(
-      newEntries.map(async ({ entry, file }) => {
+    const processBatch = async () => {
+      for (const { entry, file } of newEntries) {
         try {
           const form = new FormData();
           form.append("file", file);
@@ -109,8 +128,13 @@ export function DocumentUploadPage({ userId, userName, onContinue }: Props) {
             };
           });
         }
-      })
-    );
+      }
+    };
+
+    const previous = categoryQueuesRef.current[categoryKey] ?? Promise.resolve();
+    categoryQueuesRef.current[categoryKey] = previous
+      .catch(() => undefined)
+      .then(processBatch);
   }
 
   function removeFile(categoryKey: string, fileId: string) {
@@ -128,13 +152,24 @@ export function DocumentUploadPage({ userId, userName, onContinue }: Props) {
       {/* ── Header ── */}
       <header className="bg-white border-b border-[#e4e9ef] shrink-0">
         <div className="max-w-3xl mx-auto px-6 py-4 flex items-center justify-between">
-          <div className="flex items-center gap-2.5">
-            <div className="w-9 h-9 rounded-lg bg-[#003d5c] flex items-center justify-center">
-              <Flame className="w-4 h-4 text-[#ffcd00]" />
-            </div>
-            <div>
-              <p className="text-[15px] font-bold text-[#003d5c] leading-tight tracking-tight">FIRE</p>
-              <p className="text-[11px] text-[#5c6b7a] leading-tight mt-0.5">Financial Intelligence Engine</p>
+          <div className="flex items-center gap-3">
+            {onBack && (
+              <button
+                onClick={onBack}
+                aria-label="Back to profile"
+                className="flex items-center justify-center w-9 h-9 rounded-lg border border-[#d1d9e0] text-[#003d5c] hover:bg-[#f7f9fc] hover:border-[#003d5c] transition-all"
+              >
+                <ArrowLeft className="w-4 h-4" strokeWidth={2.25} />
+              </button>
+            )}
+            <div className="flex items-center gap-2.5">
+              <div className="w-9 h-9 rounded-lg bg-[#003d5c] flex items-center justify-center">
+                <Flame className="w-4 h-4 text-[#ffcd00]" />
+              </div>
+              <div>
+                <p className="text-[15px] font-bold text-[#003d5c] leading-tight tracking-tight">FIRE</p>
+                <p className="text-[11px] text-[#5c6b7a] leading-tight mt-0.5">Financial Intelligence Engine</p>
+              </div>
             </div>
           </div>
           <p className="text-xs font-semibold text-[#5c6b7a] uppercase tracking-wide">Step 2 of 2</p>
@@ -147,14 +182,24 @@ export function DocumentUploadPage({ userId, userName, onContinue }: Props) {
       {/* ── Body ── */}
       <main className="flex-1 overflow-y-auto">
         <div className="max-w-3xl mx-auto px-6 py-10">
-          <div className="mb-8">
-            <h1 className="text-3xl font-bold text-[#003d5c] tracking-tight">
-              Upload your financial documents
-            </h1>
-            <p className="text-[15px] text-[#5c6b7a] mt-2 leading-relaxed max-w-xl">
-              The more FIRE knows, {userName.split(" ")[0] || "the better"}, the sharper its advice.
-              All optional — you can add documents later from the chat.
-            </p>
+          <div className="mb-8 flex items-start justify-between gap-6">
+            <div>
+              <h1 className="text-3xl font-bold text-[#003d5c] tracking-tight">
+                Upload your financial documents
+              </h1>
+              <p className="text-[15px] text-[#5c6b7a] mt-2 leading-relaxed max-w-xl">
+                The more FIRE knows, {userName.split(" ")[0] || "the better"}, the sharper its advice.
+                All optional — you can add documents later from the chat.
+              </p>
+            </div>
+            <button
+              onClick={handleClearAll}
+              disabled={clearing}
+              className="shrink-0 flex items-center gap-1.5 text-xs font-semibold text-[#b91c1c] hover:bg-[#fde8e8] border border-[#f5c7c7] rounded-md px-3 py-2 transition-colors disabled:opacity-50"
+            >
+              {clearing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />}
+              Clear all data
+            </button>
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">

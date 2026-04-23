@@ -17,10 +17,13 @@ async function parseSpreadsheet(buffer: Buffer): Promise<RawTransaction[]> {
   const sheetName = workbook.SheetNames[0];
   if (!sheetName) throw new Error("Spreadsheet has no sheets.");
   const csv = XLSX.utils.sheet_to_csv(workbook.Sheets[sheetName]);
+  // Try deterministic CSV parsing first; fallback to text extraction for messy exports.
   try {
     const result = parseCSV(csv);
     if (result.length > 0) return result;
-  } catch { /* fall through to Claude */ }
+  } catch {
+    // fall through to text extraction fallback
+  }
   return extractTransactionsFromText(csv);
 }
 
@@ -141,7 +144,9 @@ export async function parseFile(file: File): Promise<RawTransaction[]> {
       try {
         const result = parseCSV(text);
         if (result.length > 0) return result;
-      } catch { /* fall through to Claude */ }
+      } catch {
+        // fall through to text extraction fallback
+      }
       return extractTransactionsFromText(text);
     }
     case "xls":

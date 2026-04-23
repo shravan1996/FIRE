@@ -60,6 +60,8 @@ model Transaction {
   createdAt   DateTime @default(now())
 
   user        UserProfile @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, date])
 }
 
 model ChatSession {

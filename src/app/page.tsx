@@ -84,6 +84,7 @@ export default function HomePage() {
         userId={session.userId}
         userName={session.userName}
         onContinue={handleDocsContinue}
+        onBack={handleBack}
       />
     );
   }
