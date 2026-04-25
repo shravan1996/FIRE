@@ -213,15 +213,40 @@ export async function categorizeTransactions(
       type: t.type,
     }));
 
+    let response = "";
     try {
-      const raw = JSON.parse(
-        await claudeComplete(CATEGORIZATION_SYSTEM, JSON.stringify(payload))
+      response = await claudeComplete(CATEGORIZATION_SYSTEM, JSON.stringify(payload));
+    } catch (err) {
+      console.error(
+        `[categorize] claudeComplete failed (chunk offset=${offset}, size=${chunk.length}):`,
+        err
       );
-      const parsed = CategorizationResultSchema.safeParse(raw);
-      return parsed.success ? parsed.data.transactions : [];
-    } catch {
       return [];
     }
+
+    let raw: unknown;
+    try {
+      raw = JSON.parse(response);
+    } catch (err) {
+      console.error(
+        `[categorize] JSON.parse failed (chunk offset=${offset}). ` +
+        `Claude returned non-JSON output. First 300 chars: ` +
+        JSON.stringify(response.slice(0, 300))
+      );
+      void err;
+      return [];
+    }
+
+    const parsed = CategorizationResultSchema.safeParse(raw);
+    if (!parsed.success) {
+      console.error(
+        `[categorize] schema validation failed (chunk offset=${offset}). ` +
+        `Issues: ${JSON.stringify(parsed.error.issues.slice(0, 3))}. ` +
+        `Raw shape: ${JSON.stringify(raw).slice(0, 300)}`
+      );
+      return [];
+    }
+    return parsed.data.transactions;
   });
 
   const categorized: CategorizedTransaction[] = [];
