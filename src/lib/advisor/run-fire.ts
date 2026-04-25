@@ -231,9 +231,39 @@ ${topMerchants}`;
     } catch { /* fall back to "None yet." */ }
   }
 
-  // Memory — exclude `uploaded_files` (rendered above) to avoid duplicating
-  // the list as a giant JSON blob in the notes section.
-  const otherMemory = ctx.userMemory.filter((m) => m.key !== "uploaded_files");
+  // Uploaded document contents — `docs_<category>` keys hold the extracted text
+  // of tax/insurance/loan/portfolio documents the user uploaded. Render them as
+  // a structured section per category so the agent can quote and reason over
+  // them, instead of dumping stringified JSON into User Notes.
+  type DocEntry = { filename?: string; uploadedAt?: string; text?: string; truncated?: boolean; originalChars?: number };
+  const docSections: string[] = [];
+  for (const m of ctx.userMemory) {
+    if (!m.key.startsWith("docs_")) continue;
+    const category = m.key.slice("docs_".length);
+    let docs: DocEntry[] = [];
+    try {
+      const parsed = JSON.parse(m.value);
+      if (Array.isArray(parsed)) docs = parsed as DocEntry[];
+    } catch { continue; }
+    if (docs.length === 0) continue;
+
+    const rendered = docs
+      .map((d) => {
+        const head = `### ${d.filename ?? "(unnamed)"} — uploaded ${d.uploadedAt?.slice(0, 10) ?? "unknown"}` +
+          (d.truncated ? ` (truncated: showing first ${d.text?.length ?? 0} of ${d.originalChars ?? "?"} chars)` : "");
+        const body = d.text?.trim() ? d.text : "(no text extracted)";
+        return `${head}\n${body}`;
+      })
+      .join("\n\n");
+    docSections.push(`## Uploaded ${category} documents\n\n${rendered}`);
+  }
+  const docsBlock = docSections.length ? docSections.join("\n\n") : "No document uploads yet.";
+
+  // Other free-form memory — anything that isn't `uploaded_files` (rendered
+  // above) or `docs_*` (rendered as full sections above).
+  const otherMemory = ctx.userMemory.filter(
+    (m) => m.key !== "uploaded_files" && !m.key.startsWith("docs_")
+  );
   const memoryText = otherMemory.length
     ? otherMemory.map((m) => `- ${m.key}: ${m.value}`).join("\n")
     : "None.";
@@ -252,6 +282,9 @@ ${txnListText}
 
 --- Uploaded Files ---
 ${uploadedFilesText}
+
+--- Uploaded Document Contents ---
+${docsBlock}
 
 --- Insights from Prior Sessions ---
 ${insightsText}

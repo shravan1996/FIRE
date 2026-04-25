@@ -7,7 +7,10 @@ import { categorizeTransactions, type RawTransaction } from "@/lib/ingestion/par
 import { prisma } from "@/lib/db";
 
 const MAX_SIZE = 10 * 1024 * 1024; // 10 MB
-const MAX_DOC_CHARS = 8000;        // cap per uploaded document stored as memory
+// Form 16 / 26AS / AIS extracts to 30-100K chars. With Claude's 1M context window
+// the agent can absorb the whole document, so cap generously and only trim when
+// a single doc would otherwise dominate the prompt.
+const MAX_DOC_CHARS = 200_000;
 
 const DOCUMENT_CATEGORIES = ["portfolio", "tax", "insurance", "loans"] as const;
 type DocumentCategory = typeof DOCUMENT_CATEGORIES[number];
@@ -102,10 +105,14 @@ async function recordUpload(
 
 /** Fire-and-forget: run Claude categorisation and update rows in place. */
 async function categoriseAndUpdate(userId: string, txns: RawTransaction[]) {
+  const start = Date.now();
+  console.log(`[upload:bg] categorise start: ${txns.length} txns`);
   try {
     const categorised = await categorizeTransactions(txns);
+    const aiMs = Date.now() - start;
+    let matched = 0;
     for (const c of categorised) {
-      await prisma.transaction.updateMany({
+      const result = await prisma.transaction.updateMany({
         where: {
           userId,
           date: c.date,
@@ -119,6 +126,22 @@ async function categoriseAndUpdate(userId: string, txns: RawTransaction[]) {
           merchant: c.merchant || null,
         },
       });
+      matched += result.count;
+    }
+    console.log(
+      `[upload:bg] categorise done: ai=${aiMs}ms ` +
+      `returned=${categorised.length}/${txns.length} matched=${matched}`
+    );
+    if (categorised.length === 0 && txns.length > 0) {
+      console.warn(
+        `[upload:bg] categorizer returned 0 results for ${txns.length} input txns — ` +
+        `claude subprocess likely failed. Check earlier [categorize] log lines.`
+      );
+    } else if (matched < categorised.length) {
+      console.warn(
+        `[upload:bg] only matched ${matched}/${categorised.length} categorised txns — ` +
+        `date/description/amount mismatch between insert and update.`
+      );
     }
   } catch (err) {
     console.error("[upload:bg] categorise failed:", err);
@@ -150,18 +173,38 @@ export async function POST(req: NextRequest) {
 
     // ─── Non-bank documents: extract raw text and store as memory ───
     if (isDocumentCategory(category)) {
-      let text = "";
+      let text: string;
       try {
         text = (await extractFileText(file)).trim();
       } catch (extractErr) {
-        console.warn(`[upload] text extraction failed for ${file.name}:`, extractErr);
+        const reason = extractErr instanceof Error ? extractErr.message : String(extractErr);
+        console.error(`[upload] text extraction failed for ${file.name}:`, extractErr);
+        return NextResponse.json(
+          {
+            error: `Could not read ${file.name}: ${reason}. ` +
+              `If this is a password-protected or scanned PDF, unlock or OCR it first.`,
+          },
+          { status: 422 }
+        );
       }
 
+      if (text.length < 20) {
+        return NextResponse.json(
+          {
+            error: `Extracted very little readable text from ${file.name} (${text.length} chars). ` +
+              `It may be a scanned image PDF — try a text-based export or OCR the file first.`,
+          },
+          { status: 422 }
+        );
+      }
+
+      const truncated = text.length > MAX_DOC_CHARS;
       const key = `docs_${category}`;
       const entry = {
         filename: file.name,
         uploadedAt: new Date().toISOString(),
         text: text.slice(0, MAX_DOC_CHARS),
+        ...(truncated ? { truncated: true, originalChars: text.length } : {}),
       };
 
       const existing = await prisma.userMemory.findUnique({
@@ -185,12 +228,15 @@ export async function POST(req: NextRequest) {
 
       await recordUpload(userId, file.name, category);
 
+      const noteSuffix = truncated
+        ? ` (kept first ${MAX_DOC_CHARS.toLocaleString()} of ${text.length.toLocaleString()} chars)`
+        : "";
       return NextResponse.json({
         success: true,
         category,
-        message: text.length > 20
-          ? `Saved ${file.name}.`
-          : `Recorded ${file.name} (limited text extracted).`,
+        chars: text.length,
+        truncated,
+        message: `Saved ${file.name}${noteSuffix}.`,
       });
     }
 
